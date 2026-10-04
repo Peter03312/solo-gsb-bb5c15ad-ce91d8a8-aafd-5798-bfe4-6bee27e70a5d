@@ -30,11 +30,17 @@
     </div>
 
     <h2>事件</h2>
-    <p class="hint">记录每个事件的起始时间范围与持续分钟数。缺少时间范围的事件将作为“暂存”保存，暂不参与推算。</p>
+    <p class="hint">记录每个事件的起始时间范围与持续分钟数。缺少时间范围的事件将作为“暂存”保存，暂不参与推算。
+      <strong>跨地区时间线</strong>：在“时区”列填写 IANA 时区（如 <code>Asia/Shanghai</code>、
+      <code>America/New_York</code>），最早/最晚开始即须按<strong>当地时间 + UTC 偏移</strong>填写
+      （偏移自动按该时区当日规则预填，夏令时重复时刻可在 −04:00/−05:00 间手动选择）；
+      不存在的当地时刻或错误偏移会被整次保存拒绝。未填写时区的事件沿用原有无时区语义；
+      带时区与未带时区的事件之间不能建立“先于”关系。</p>
+    <datalist id="tz-list"></datalist>
     <table id="events-table">
       <thead>
         <tr>
-          <th>事件名称</th><th>最早开始</th><th>最晚开始</th><th>持续(分钟)</th><th>备注</th><th></th>
+          <th>事件名称</th><th>时区(IANA，可空)</th><th>最早开始(当地+偏移)</th><th>最晚开始(当地+偏移)</th><th>持续(分钟)</th><th>备注</th><th></th>
         </tr>
       </thead>
       <tbody></tbody>

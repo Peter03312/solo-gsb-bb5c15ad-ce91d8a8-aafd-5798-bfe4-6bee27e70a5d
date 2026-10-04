@@ -8,6 +8,14 @@
 未设置间隔的旧关系等价于 最短等待=0、最长等待不限，也就是旧语义的
 “A 开始 + A 持续 <= B 开始”，推算结果与升级前完全一致。
 
+时区：事件可指定 IANA 时区（timezone 字段），其开始时间为带 UTC 偏移的
+当地时间。所有关系约束（持续时长、最短/最长等待、输入范围先后）均按
+**绝对分钟**（aware datetime）施加与比较，因此跨时区的两个事件可直接
+推算；推算结果再按各事件自身时区转回当地时间 + 偏移展示（依据链中每个
+事件的时间均按其当地时间与偏移显示）。未指定时区的事件沿用旧语义
+（naive 时间），只能与同样未指定时区的事件建立关系（保存层已拒绝混建，
+本层再防御一次）。
+
 输出：每个完整事件的可行开始时间窗（最早/最晚可行开始）及推算依据链；
 缺少时间范围的事件作为“暂存”处理，其关联关系不参与推算并标明原因。
 
@@ -23,13 +31,11 @@
 
 from datetime import datetime, timedelta
 
+import timeutil
+
 
 def _parse(s):
     return datetime.fromisoformat(s)
-
-
-def _fmt(dt):
-    return dt.isoformat(timespec="minutes")
 
 
 def _gap_min(r):
@@ -65,6 +71,22 @@ def compute(events, relations):
     """
     by_id = {e["id"]: e for e in events}
 
+    # 每个事件的时区（IANA 名 → ZoneInfo）：未指定时区为 None。
+    # 带时区与未带时区事件之间的关系已在保存校验层拒绝；这里再防御一次，
+    # 绝不允许 aware 与 naive 时刻混算（二者无法比较/做差）。
+    zones = {}
+    for e in events:
+        name = e.get("timezone")
+        if name:
+            try:
+                zones[e["id"]] = timeutil.get_zone(name)
+            except timeutil.TimeError:
+                zones[e["id"]] = None
+
+    def _fmt(dt, event_id):
+        """按该事件的当地时间 + UTC 偏移展示；未指定时区时沿用旧语义。"""
+        return timeutil.format_in_zone(dt, zones.get(event_id))
+
     # ---- 1. 区分完整事件与暂存事件 -------------------------------------
     drafts = []
     active = {}
@@ -80,6 +102,7 @@ def compute(events, relations):
             drafts.append({
                 "id": e["id"],
                 "name": e["name"],
+                "timezone": e.get("timezone"),
                 "reason": "缺少" + "、".join(missing) + "，已暂存，不参与本次推算",
             })
         else:
@@ -103,6 +126,12 @@ def compute(events, relations):
                 "min_gap_minutes": _gap_min(r), "max_gap_minutes": _gap_max(r),
                 "reason": "关联事件「" + "、".join(inactive) + "」处于暂存状态，该“先于”关系暂不参与推算",
             })
+        elif (zones.get(a) is None) != (zones.get(b) is None):
+            skipped_relations.append({
+                "id": r["id"], "predecessor_id": a, "successor_id": b,
+                "min_gap_minutes": _gap_min(r), "max_gap_minutes": _gap_max(r),
+                "reason": "关系一端为带时区事件、另一端为未指定时区事件，二者无法按绝对时间推算，已忽略",
+            })
         else:
             active_relations.append(r)
 
@@ -125,7 +154,7 @@ def compute(events, relations):
                 "type": "invalid_range",
                 "event_ids": [i],
                 "message": "事件「{}」输入的时间范围自相矛盾：最早开始 {} 晚于最晚开始 {}".format(
-                    e["name"], _fmt(est[i]), _fmt(lst[i])),
+                    e["name"], _fmt(est[i], i), _fmt(lst[i], i)),
             })
 
     # ---- 3. 前向/后向松弛（Bellman-Ford 方式，检测循环） -----------------
@@ -225,7 +254,8 @@ def compute(events, relations):
             val = est[cur] if kind == "est" else lst[cur]
             if src is None:
                 label = "最早开始" if kind == "est" else "最晚开始"
-                steps.append({"text": "「{}」输入的{}为 {}".format(ev["name"], label, _fmt(val))})
+                steps.append({"text": "「{}」输入的{}为 {}".format(
+                    ev["name"], label, _fmt(val, cur))})
                 break
             other, rid, edge = src
             oev = active[other]
@@ -238,11 +268,12 @@ def compute(events, relations):
                     gaps = gap_text(g, None)
                     if gaps:
                         text += "、" + gaps
-                    text += " ⇒ 「{}」最早开始不早于 {}".format(ev["name"], _fmt(val))
+                    text += " ⇒ 「{}」最早开始不早于 {}".format(ev["name"], _fmt(val, cur))
                 else:
                     # cur 先于 other 且设最长等待：cur 最早开始 = other 最早开始 - cur 持续 - 最长等待
                     text = "「{}」先于「{}」且最长等待 {} 分钟（「{}」持续 {} 分钟）⇒ 「{}」最早开始不早于 {}".format(
-                        ev["name"], oev["name"], m, ev["name"], dur[cur], ev["name"], _fmt(val))
+                        ev["name"], oev["name"], m, ev["name"], dur[cur], ev["name"],
+                        _fmt(val, cur))
             else:
                 if edge == "min":
                     # cur 先于 other：cur 最晚开始 = other 最晚开始 - cur 持续 - 最短等待
@@ -251,11 +282,12 @@ def compute(events, relations):
                     gaps = gap_text(g, None)
                     if gaps:
                         text += "、" + gaps
-                    text += " ⇒ 「{}」最晚开始不晚于 {}".format(ev["name"], _fmt(val))
+                    text += " ⇒ 「{}」最晚开始不晚于 {}".format(ev["name"], _fmt(val, cur))
                 else:
                     # other 先于 cur 且设最长等待：cur 最晚开始 = other 最晚开始 + other 持续 + 最长等待
                     text = "「{}」先于「{}」且最长等待 {} 分钟（「{}」持续 {} 分钟）⇒ 「{}」最晚开始不晚于 {}".format(
-                        oev["name"], ev["name"], m, oev["name"], dur[other], ev["name"], _fmt(val))
+                        oev["name"], ev["name"], m, oev["name"], dur[other], ev["name"],
+                        _fmt(val, cur))
             steps.append({"text": text})
             if cur in seen:
                 steps.append({"text": loop_text})
@@ -360,13 +392,25 @@ def compute(events, relations):
         conflicts.append(conflict)
 
     # ---- 6. 汇总每个事件的可行时间窗 ------------------------------------
+    # 所有推算均按绝对分钟（aware datetime 表示绝对时刻）完成；此处按各
+    # 事件自己的时区把绝对时刻转回当地时间 + 偏移展示，跨时区事件各显其地时间。
     windows = {}
     for i in active:
+        # 结束时刻也按绝对分钟计算，再转回本事件时区，避免在带时区墙上
+        # 直接加分钟带来的 fold/gap 挂错偏移问题。
+        z = zones.get(i)
+        if z is not None:
+            earliest_end = (est[i] + timedelta(minutes=dur[i])).astimezone(z)
+            latest_end = (lst[i] + timedelta(minutes=dur[i])).astimezone(z)
+        else:
+            earliest_end = est[i] + timedelta(minutes=dur[i])
+            latest_end = lst[i] + timedelta(minutes=dur[i])
         windows[i] = {
-            "earliest_start": _fmt(est[i]),
-            "latest_start": _fmt(lst[i]),
-            "earliest_end": _fmt(est[i] + timedelta(minutes=dur[i])),
-            "latest_end": _fmt(lst[i] + timedelta(minutes=dur[i])),
+            "timezone": active[i].get("timezone"),
+            "earliest_start": _fmt(est[i], i),
+            "latest_start": _fmt(lst[i], i),
+            "earliest_end": _fmt(earliest_end, i),
+            "latest_end": _fmt(latest_end, i),
             "earliest_chain": build_chain(i, "est"),
             "latest_chain": build_chain(i, "lst"),
         }
@@ -385,7 +429,7 @@ def compute(events, relations):
                     "type": "window",
                     "event_ids": [i],
                     "message": "事件「{}」推算后最早可行开始 {} 晚于最晚可行开始 {}，约束冲突".format(
-                        active[i]["name"], _fmt(est[i]), _fmt(lst[i])),
+                        active[i]["name"], _fmt(est[i], i), _fmt(lst[i], i)),
                     "earliest_chain": windows[i]["earliest_chain"],
                     "latest_chain": windows[i]["latest_chain"],
                 })

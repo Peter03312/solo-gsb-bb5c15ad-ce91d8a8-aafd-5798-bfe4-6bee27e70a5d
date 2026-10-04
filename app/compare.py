@@ -13,6 +13,7 @@ result 为当时推算结果（windows 以当时行号为键，快照 key 形如
 
 # 参与对照的输入字段：(字段名, 展示名)
 INPUT_FIELDS = [
+    ("timezone", "时区"),
     ("earliest_start", "最早开始"),
     ("latest_start", "最晚开始"),
     ("duration_minutes", "持续分钟数"),
@@ -69,6 +70,7 @@ def _event_brief(event, version_data):
     return {
         "uid": event.get("uid"),
         "name": event.get("name"),
+        "timezone": event.get("timezone"),
         "earliest_start": event.get("earliest_start"),
         "latest_start": event.get("latest_start"),
         "duration_minutes": event.get("duration_minutes"),

@@ -8,6 +8,12 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 COPY app/ /app/
 
+# 跨地区时间线依赖系统 IANA 时区库（zoneinfo 读取 /usr/share/zoneinfo）。
+# 应用本身仍仅使用 Python 标准库，无任何 pip 第三方依赖。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN mkdir -p /data
 VOLUME ["/data"]
 EXPOSE 8000

@@ -50,6 +50,12 @@ def ev(key, name, es, ls, dur):
             "duration_minutes": dur, "note": ""}
 
 
+def zev(key, name, tz, es, ls, dur):
+    return {"key": key, "name": name, "timezone": tz,
+            "earliest_start": es, "latest_start": ls,
+            "duration_minutes": dur, "note": ""}
+
+
 def rel(a, b, min_g=None, max_g=None):
     r = {"predecessor_key": a, "successor_key": b}
     if min_g is not None:
@@ -256,6 +262,140 @@ def test_draft_relation_skipped_with_reason():
     s = res["skipped_relations"][0]
     assert "暂存" in s["reason"]
     assert s["min_gap_minutes"] == 5
+
+
+def _put_zoned(rid, base, events, relations=None):
+    return req("PUT", "/api/reviews/{}".format(rid), {
+        "base_version": base, "title": "跨地区", "events": events,
+        "relations": relations or []})
+
+
+def test_cross_timezone_save_compute_and_versions():
+    status, bundle = req("POST", "/api/reviews", {"title": "跨地区"})
+    rid = bundle["review"]["id"]
+    events = [
+        zev("a", "上海告警", "Asia/Shanghai",
+            "2026-06-01T12:00+08:00", "2026-06-01T13:00+08:00", 60),
+        zev("b", "纽约响应", "America/New_York",
+            "2026-06-01T00:00-04:00", "2026-06-01T06:00-04:00", 30),
+    ]
+    status, bundle = _put_zoned(rid, 1, events, [rel("a", "b")])
+    assert status == 200, bundle
+    # live 事件保留时区与带偏移的当地时间，不被改写
+    for e, tz in zip(bundle["events"], ["Asia/Shanghai", "America/New_York"]):
+        assert e["timezone"] == tz
+    res = bundle["computation"]["result"]
+    assert res["status"] == "ok", res
+    idb = next(e["id"] for e in bundle["events"] if e["name"] == "纽约响应")
+    win_b = res["windows"][str(idb)]
+    # 上海最早 12:00+08 + 60 分钟 = 纽约 01:00-04（绝对分钟推算）
+    assert win_b["earliest_start"] == "2026-06-01T01:00-04:00", win_b
+    assert win_b["timezone"] == "America/New_York"
+    # 可定稿
+    status, _ = req("POST", "/api/reviews/{}/finalize".format(rid),
+                    {"base_version": 2})
+    assert status == 200
+    # 版本回看保留时区与偏移
+    status, v2 = req("GET", "/api/reviews/{}/versions/2".format(rid))
+    assert status == 200
+    snap = v2["input"]["events"]
+    assert snap[0]["timezone"] == "Asia/Shanghai"
+    assert snap[0]["earliest_start"] == "2026-06-01T12:00+08:00"
+    assert v2["result"]["windows"][str(idb)]["earliest_start"] == "2026-06-01T01:00-04:00"
+    # 恢复为新草稿：时区与偏移保留并重新推算
+    status, restored = req("POST", "/api/reviews/{}/versions/2/restore".format(rid),
+                           {"base_version": 3})
+    assert status == 200, restored
+    assert restored["review"]["version"] == 4
+    assert {e["timezone"] for e in restored["events"]} == {
+        "Asia/Shanghai", "America/New_York"}
+
+
+def test_invalid_zoned_times_whole_save_rejected():
+    status, bundle = req("POST", "/api/reviews", {"title": "非法时区输入"})
+    rid = bundle["review"]["id"]
+
+    def put(events, base=1):
+        return _put_zoned(rid, base, events)
+
+    base_ny = ("2026-11-01T02:30", "2026-11-01T04:00")
+    bad_cases = [
+        # 春令时不存在的当地时刻
+        [zev("a", "A", "America/New_York",
+             "2026-03-08T02:30-05:00", "2026-03-08T05:00-05:00", 10)],
+        # 普通时刻错误偏移（6 月应为 -04）
+        [zev("a", "A", "America/New_York",
+             "2026-06-01T02:30-05:00", "2026-06-01T05:00-04:00", 10)],
+        # 夏令时重复时刻用了无效偏移
+        [zev("a", "A", "America/New_York",
+             "2026-11-01T01:30+00:00", "2026-11-01T05:00-05:00", 10)],
+        # 带时区事件却给了不带偏移的时间
+        [zev("a", "A", "Asia/Shanghai",
+             "2026-06-01T10:00", "2026-06-01T11:00+08:00", 10)],
+        # 非法 IANA 时区名
+        [zev("a", "A", "Foo/Bar",
+             "2026-06-01T10:00+08:00", "2026-06-01T11:00+08:00", 10)],
+    ]
+    for events in bad_cases:
+        status, resp = put(events)
+        assert status == 400, (events, resp)
+        assert "error" in resp
+    # 重复时刻的两个有效偏移都应被接受（据偏移区分两个绝对时刻）
+    next_base = 1
+    for off in ("-04:00", "-05:00"):
+        events = [zev("a", "A", "America/New_York",
+                      "2026-11-01T01:30" + off, "2026-11-01T05:00-05:00", 10)]
+        status, resp = put(events, base=next_base)
+        assert status == 200, (off, resp)
+        # 偏移原样保留（fold 区分）
+        saved = resp["events"][0]
+        assert saved["earliest_start"] == "2026-11-01T01:30" + off
+        next_base = resp["review"]["version"]
+
+
+def test_naive_event_rejects_offset_and_mixed_relation():
+    status, bundle = req("POST", "/api/reviews", {"title": "混用拒绝"})
+    rid = bundle["review"]["id"]
+    # 未指定时区的事件夹带偏移 → 400
+    status, resp = _put_zoned(rid, 1, [
+        ev("a", "A", "2026-06-01T10:00+08:00", "2026-06-01T11:00", 10)])
+    assert status == 400 and "未指定时区" in resp["error"], resp
+    # 先存一个合法的全带时区版本（v2），再尝试混建关系 → 400，版本不推进
+    events = [
+        zev("a", "上海", "Asia/Shanghai",
+            "2026-06-01T10:00+08:00", "2026-06-01T11:00+08:00", 10),
+        zev("b", "纽约", "America/New_York",
+            "2026-06-01T00:00-04:00", "2026-06-01T06:00-04:00", 10),
+    ]
+    status, bundle = _put_zoned(rid, 1, events, [rel("a", "b")])
+    assert status == 200
+    events[1].pop("timezone")
+    events[1]["earliest_start"] = "2026-06-01T00:00"
+    events[1]["latest_start"] = "2026-06-01T06:00"
+    status, resp = _put_zoned(rid, 2, events, [rel("a", "b")])
+    assert status == 400, resp
+    assert "不得建立" in resp["error"] and "时区" in resp["error"]
+    # 记录未改动：仍为 v2，两端都带时区
+    status, cur = req("GET", "/api/reviews/{}".format(rid))
+    assert cur["review"]["version"] == 2
+    assert all(e["timezone"] for e in cur["events"])
+
+
+def test_naive_review_unchanged_alongside_zoned():
+    # 不带时区的现有输入完全沿用旧语义（字符串无偏移、窗口无偏移）
+    status, bundle = req("POST", "/api/reviews", {"title": "旧语义"})
+    rid = bundle["review"]["id"]
+    status, bundle = req("PUT", "/api/reviews/{}".format(rid), {
+        "base_version": 1, "title": "旧语义",
+        "events": [ev("a", "告警", "2026-10-01T10:00", "2026-10-01T10:30", 15),
+                   ev("b", "响应", "2026-10-01T10:00", "2026-10-01T12:00", 30)],
+        "relations": [rel("a", "b")]})
+    assert status == 200, bundle
+    idb = next(e["id"] for e in bundle["events"] if e["name"] == "响应")
+    w = bundle["computation"]["result"]["windows"][str(idb)]
+    assert w["earliest_start"] == "2026-10-01T10:15"
+    assert "+" not in w["earliest_start"] and w["timezone"] is None
+    assert all(e["timezone"] is None for e in bundle["events"])
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

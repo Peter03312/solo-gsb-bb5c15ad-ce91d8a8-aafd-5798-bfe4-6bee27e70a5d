@@ -36,10 +36,11 @@ CREATE TABLE IF NOT EXISTS events (
     review_id       INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
     name            TEXT NOT NULL,
     earliest_start  TEXT,                          -- ISO 分钟精度，可空（暂存）
-    latest_start    TEXT,
+    latest_start    TEXT,                          -- 带时区时含 UTC 偏移
     duration_minutes INTEGER,
     note            TEXT NOT NULL DEFAULT '',
-    uid             TEXT                           -- 跨版本持续身份，保存/恢复时沿用
+    uid             TEXT,                          -- 跨版本持续身份，保存/恢复时沿用
+    timezone        TEXT                           -- IANA 时区名；NULL = 未指定时区（旧语义）
 );
 CREATE TABLE IF NOT EXISTS relations (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,6 +141,9 @@ def _migrate(conn):
         conn.execute("ALTER TABLE events ADD COLUMN uid TEXT")
         for (eid,) in conn.execute("SELECT id FROM events WHERE uid IS NULL").fetchall():
             conn.execute("UPDATE events SET uid=? WHERE id=?", (_new_uid(), eid))
+    if "timezone" not in event_cols:
+        # 跨地区时区支持：旧事件一律不带时区，沿用 naive 旧语义，不改写任何旧数据
+        conn.execute("ALTER TABLE events ADD COLUMN timezone TEXT")
 
 
 def connect(db_path):
@@ -371,6 +375,7 @@ def _current_input(conn, review_id):
         "key": key_by_id[e["id"]],
         "uid": e.get("uid"),
         "name": e["name"],
+        "timezone": e.get("timezone"),
         "earliest_start": e["earliest_start"],
         "latest_start": e["latest_start"],
         "duration_minutes": e["duration_minutes"],
@@ -398,6 +403,7 @@ def _save_version(conn, review_id, version, title, events, relations, kind, now=
         "key": key_by_id[e["id"]],
         "uid": e.get("uid"),
         "name": e["name"],
+        "timezone": e.get("timezone"),
         "earliest_start": e["earliest_start"],
         "latest_start": e["latest_start"],
         "duration_minutes": e["duration_minutes"],
@@ -430,9 +436,9 @@ def _replace_input(conn, review_id, events, relations):
         used_uids.add(uid)
         cur = conn.execute(
             "INSERT INTO events (review_id, name, earliest_start, latest_start,"
-            " duration_minutes, note, uid) VALUES (?,?,?,?,?,?,?)",
+            " duration_minutes, note, uid, timezone) VALUES (?,?,?,?,?,?,?,?)",
             (review_id, e["name"], e.get("earliest_start"), e.get("latest_start"),
-             e.get("duration_minutes"), e.get("note", ""), uid))
+             e.get("duration_minutes"), e.get("note", ""), uid, e.get("timezone")))
         key_to_id[e["key"]] = cur.lastrowid
     for r in relations:
         min_gap = r.get("min_gap_minutes")

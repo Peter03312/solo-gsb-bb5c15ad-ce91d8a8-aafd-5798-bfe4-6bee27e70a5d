@@ -6,10 +6,89 @@ const $ = (sel) => document.querySelector(sel);
 const state = {
   reviews: [],
   current: null,      // 服务器返回的复盘快照 {review, events, relations, computation}
-  editEvents: [],     // 编辑中的事件 [{key, id?, name, earliest_start, latest_start, duration_minutes, note}]
+  editEvents: [],     // 编辑中的事件 [{key, id?, name, timezone, earliest_start, latest_start,
+                      //   earliest_offset, latest_offset, duration_minutes, note}]
   editRelations: [],  // 编辑中的关系 [{predecessor_key, successor_key, min_gap_minutes, max_gap_minutes}]
   seq: 0,
 };
+
+/* ------------------------------------------------------------ 时区工具 */
+
+/* 常用 IANA 时区候选；现代浏览器再用 Intl.supportedValuesOf 补全完整列表 */
+const COMMON_TZS = [
+  "UTC", "Asia/Shanghai", "Asia/Hong_Kong", "Asia/Tokyo", "Asia/Singapore",
+  "Asia/Kolkata", "Asia/Dubai", "Europe/London", "Europe/Berlin", "Europe/Paris",
+  "America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles",
+  "America/Sao_Paulo", "Australia/Sydney", "Pacific/Auckland",
+];
+
+function allTimezones() {
+  let list = COMMON_TZS.slice();
+  try {
+    if (Intl.supportedValuesOf) {
+      for (const z of Intl.supportedValuesOf("timeZone")) {
+        if (!list.includes(z)) list.push(z);
+      }
+    }
+  } catch (e) { /* 旧浏览器忽略，用常用列表兜底 */ }
+  return list;
+}
+
+/* 计算某时区在给定 Date 绝对时刻的 UTC 偏移字符串，如 -04:00；失败返回 "" */
+function offsetForInstant(zone, instant) {
+  try {
+    const dtf = new Intl.DateTimeFormat("en-US", {
+      timeZone: zone, hour12: false,
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    });
+    const parts = {};
+    for (const p of dtf.formatToParts(instant)) parts[p.type] = p.value;
+    const asUTC = Date.UTC(+parts.year, +parts.month - 1, +parts.day,
+      +parts.hour % 24, +parts.minute, +parts.second);
+    let diffMin = Math.round((asUTC - instant.getTime()) / 60000);
+    const sign = diffMin >= 0 ? "+" : "-";
+    diffMin = Math.abs(diffMin);
+    const hh = String(Math.floor(diffMin / 60)).padStart(2, "0");
+    const mm = String(diffMin % 60).padStart(2, "0");
+    return `${sign}${hh}:${mm}`;
+  } catch (e) {
+    return "";
+  }
+}
+
+/* 墙上时间 "YYYY-MM-DDTHH:mm" + 时区 → 该时刻建议偏移（按墙上时间当作同一偏移解释） */
+function suggestOffset(zone, wall) {
+  if (!zone || !wall) return "";
+  const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})$/.exec(String(wall));
+  if (!m) return "";
+  const instant = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]));
+  if (isNaN(instant.getTime())) return "";
+  return offsetForInstant(zone, instant);
+}
+
+const OFFSET_RE = /^[+-]\d{2}:\d{2}$/;
+
+/* 拆分服务端时间串：naive "YYYY-MM-DDTHH:mm" → [wall, ""]；
+   带偏移 "YYYY-MM-DDTHH:mm+08:00" → [wall, "+08:00"] */
+function splitZoned(s) {
+  const str = String(s || "");
+  const m = /^(.*?)([+-]\d{2}:\d{2}|Z)$/.exec(str);
+  if (!m) return [str, ""];
+  const off = m[2] === "Z" ? "+00:00" : m[2];
+  return [m[1], off];
+}
+
+/* 组合保存用时间串：带时区事件 = 墙上时间 + 偏移；不带时区 = 墙上时间 */
+function joinZoned(wall, offset) {
+  if (!wall) return null;
+  return offset ? `${wall}${offset}` : wall;
+}
+
+function initTimezoneDatalist() {
+  const dl = $("#tz-list");
+  dl.innerHTML = allTimezones().map((z) => `<option value="${z}"></option>`).join("");
+}
 
 function newKey() { return "k" + (++state.seq) + "_" + Date.now(); }
 
@@ -65,16 +144,23 @@ async function openReview(id) {
 
 function resetEdits() {
   const b = state.current;
-  state.editEvents = b.events.map((e) => ({
-    key: "id_" + e.id,
-    id: e.id,
-    uid: e.uid || "",   // 事件持续身份：保存时回传，跨版本对照按它配对
-    name: e.name,
-    earliest_start: e.earliest_start || "",
-    latest_start: e.latest_start || "",
-    duration_minutes: e.duration_minutes === null ? "" : e.duration_minutes,
-    note: e.note || "",
-  }));
+  state.editEvents = b.events.map((e) => {
+    const [esWall, esOff] = splitZoned(e.earliest_start);
+    const [lsWall, lsOff] = splitZoned(e.latest_start);
+    return {
+      key: "id_" + e.id,
+      id: e.id,
+      uid: e.uid || "",   // 事件持续身份：保存时回传，跨版本对照按它配对
+      name: e.name,
+      timezone: e.timezone || "",
+      earliest_start: e.earliest_start ? esWall : "",
+      earliest_offset: esOff,
+      latest_start: e.latest_start ? lsWall : "",
+      latest_offset: lsOff,
+      duration_minutes: e.duration_minutes === null ? "" : e.duration_minutes,
+      note: e.note || "",
+    };
+  });
   const idToKey = {};
   for (const e of state.editEvents) if (e.id) idToKey[e.id] = e.key;
   state.editRelations = b.relations.map((r) => ({
@@ -127,16 +213,50 @@ function renderEventsTable() {
     tr.dataset.key = e.key;
     tr.innerHTML =
       `<td><input data-f="name" type="text" value=""></td>` +
-      `<td><input data-f="earliest_start" type="datetime-local"></td>` +
-      `<td><input data-f="latest_start" type="datetime-local"></td>` +
+      `<td><input data-f="timezone" type="text" list="tz-list" class="tz-input" placeholder="未指定"></td>` +
+      `<td><div class="zoned-time"><input data-f="earliest_start" type="datetime-local">` +
+      `<input data-f="earliest_offset" type="text" class="offset-input" maxlength="6" placeholder="+08:00"></div></td>` +
+      `<td><div class="zoned-time"><input data-f="latest_start" type="datetime-local">` +
+      `<input data-f="latest_offset" type="text" class="offset-input" maxlength="6" placeholder="+08:00"></div></td>` +
       `<td><input data-f="duration_minutes" type="number" min="0" style="width:80px"></td>` +
       `<td><input data-f="note" type="text"></td>` +
       `<td><button class="row-del" title="删除事件">✕</button></td>`;
     tr.querySelector('[data-f="name"]').value = e.name;
+    tr.querySelector('[data-f="timezone"]').value = e.timezone;
     tr.querySelector('[data-f="earliest_start"]').value = e.earliest_start;
+    tr.querySelector('[data-f="earliest_offset"]').value = e.earliest_offset || "";
     tr.querySelector('[data-f="latest_start"]').value = e.latest_start;
+    tr.querySelector('[data-f="latest_offset"]').value = e.latest_offset || "";
     tr.querySelector('[data-f="duration_minutes"]').value = e.duration_minutes;
     tr.querySelector('[data-f="note"]').value = e.note;
+
+    const tzInput = tr.querySelector('[data-f="timezone"]');
+    const bindOffset = (wallSel, offSel) => {
+      tr.querySelector(wallSel).addEventListener("change", (ev) => {
+        // 墙上时间改变时：带时区且偏移为空则按当日规则预填（不覆盖用户已选偏移）
+        if (tzInput.value.trim() && !tr.querySelector(offSel).value) {
+          const sug = suggestOffset(tzInput.value.trim(), ev.target.value);
+          if (sug) tr.querySelector(offSel).value = sug;
+        }
+      });
+    };
+    bindOffset('[data-f="earliest_start"]', '[data-f="earliest_offset"]');
+    bindOffset('[data-f="latest_start"]', '[data-f="latest_offset"]');
+    tzInput.addEventListener("change", (ev) => {
+      // 时区改变：为已填墙上时间重新预填偏移（服务器为最终裁判；
+      // 夏令时重复时刻由用户在两个有效偏移之间手动选定）
+      const tz = ev.target.value.trim();
+      for (const [wf, of2] of [["earliest_start", "earliest_offset"],
+                               ["latest_start", "latest_offset"]]) {
+        const wall = tr.querySelector(`[data-f="${wf}"]`).value;
+        const offEl = tr.querySelector(`[data-f="${of2}"]`);
+        if (tz && wall) {
+          const sug = suggestOffset(tz, wall);
+          if (sug) offEl.value = sug;
+        }
+      }
+    });
+
     tr.querySelector(".row-del").addEventListener("click", () => {
       syncFromDOM();
       state.editEvents = state.editEvents.filter((x) => x.key !== e.key);
@@ -212,6 +332,7 @@ function chainHtml(chain) {
 }
 
 function fmtTime(s) { return s ? escapeHtml(String(s).replace("T", " ")) : "—（暂存）"; }
+function tzBadge(tz) { return tz ? ` <span class="tz-tag">${escapeHtml(tz)}</span>` : ""; }
 
 function buildResultHtml(res, evByKey) {
   // 生成推算结果各分区 HTML。evByKey: {窗口中使用的事件 id/key -> 事件输入}
@@ -261,7 +382,7 @@ function buildResultHtml(res, evByKey) {
         const name = ev ? ev.name : id;
         const dur = ev ? ev.duration_minutes : "";
         return `<div class="card">` +
-          `<h3>「${escapeHtml(name)}」 <span class="window">${w.earliest_start.replace("T", " ")} ~ ${w.latest_start.replace("T", " ")}</span></h3>` +
+          `<h3>「${escapeHtml(name)}」${tzBadge(w.timezone)} <span class="window">${w.earliest_start.replace("T", " ")} ~ ${w.latest_start.replace("T", " ")}</span></h3>` +
           `<div class="hint">可行结束窗口：${w.earliest_end.replace("T", " ")} ~ ${w.latest_end.replace("T", " ")}` +
           (dur === null || dur === undefined || dur === "" ? "" : `（持续 ${dur} 分钟）`) + `</div>` +
           `<details><summary>最早可行开始的依据链</summary>${chainHtml(w.earliest_chain)}</details>` +
@@ -302,17 +423,53 @@ function syncFromDOM() {
     const e = state.editEvents.find((x) => x.key === tr.dataset.key);
     if (!e) return;
     e.name = tr.querySelector('[data-f="name"]').value.trim();
+    e.timezone = tr.querySelector('[data-f="timezone"]').value.trim();
     e.earliest_start = tr.querySelector('[data-f="earliest_start"]').value;
     e.latest_start = tr.querySelector('[data-f="latest_start"]').value;
+    e.earliest_offset = tr.querySelector('[data-f="earliest_offset"]').value.trim();
+    e.latest_offset = tr.querySelector('[data-f="latest_offset"]').value.trim();
     const d = tr.querySelector('[data-f="duration_minutes"]').value;
     e.duration_minutes = d === "" ? "" : parseInt(d, 10);
     e.note = tr.querySelector('[data-f="note"]').value;
   });
 }
 
+/* 保存前校验带时区事件的偏移填写；返回错误消息，合法返回 "" */
+function validateZonedTimes() {
+  for (const e of state.editEvents) {
+    if (!e.timezone) continue;
+    for (const [wall, off, label] of [
+      [e.earliest_start, e.earliest_offset, "最早开始"],
+      [e.latest_start, e.latest_offset, "最晚开始"],
+    ]) {
+      if (wall && !off) {
+        return `事件「${e.name}」指定了时区 ${e.timezone}，${label}须带 UTC 偏移（如 -05:00）`;
+      }
+      if (wall && !OFFSET_RE.test(off)) {
+        return `事件「${e.name}」${label}的偏移「${off}」格式不正确，应为 +HH:MM 或 -HH:MM`;
+      }
+    }
+  }
+  // 带时区与未带时区事件之间不得建立关系（服务器同样会整次拒绝）
+  const tzByKey = {};
+  for (const e of state.editEvents) tzByKey[e.key] = !!e.timezone;
+  for (const r of state.editRelations) {
+    if (tzByKey[r.predecessor_key] !== tzByKey[r.successor_key]) {
+      return `关系「${eventName(r.predecessor_key)}」先于「${eventName(r.successor_key)}」不允许建立：` +
+        `带 IANA 时区的事件与未指定时区的事件之间不能建立关系`;
+    }
+  }
+  return "";
+}
+
 async function save() {
   if (!state.current) return;
   syncFromDOM();
+  const zonedError = validateZonedTimes();
+  if (zonedError) {
+    showBanner("⚠ " + escapeHtml(zonedError));
+    return;
+  }
   const relations = [];
   for (const r of state.editRelations) {
     const min = parseGapInput(r.min_gap_minutes, "最短等待", 0);
@@ -340,8 +497,13 @@ async function save() {
       key: e.key,
       uid: e.uid || "",
       name: e.name,
-      earliest_start: e.earliest_start || null,
-      latest_start: e.latest_start || null,
+      timezone: e.timezone || null,
+      earliest_start: e.earliest_start
+        ? joinZoned(e.earliest_start, e.timezone ? e.earliest_offset : "")
+        : null,
+      latest_start: e.latest_start
+        ? joinZoned(e.latest_start, e.timezone ? e.latest_offset : "")
+        : null,
       duration_minutes: e.duration_minutes === "" ? null : e.duration_minutes,
       note: e.note,
     })),
@@ -492,7 +654,7 @@ function renderVersionDetail(detail) {
   for (const e of events) byKey[e.key] = e;
 
   const rows = events.map((e) =>
-    `<tr><td>${escapeHtml(e.name)}</td>` +
+    `<tr><td>${escapeHtml(e.name)}${tzBadge(e.timezone)}</td>` +
     `<td>${fmtTime(e.earliest_start)}</td>` +
     `<td>${fmtTime(e.latest_start)}</td>` +
     `<td>${e.duration_minutes === null || e.duration_minutes === undefined ? "—" : e.duration_minutes}</td>` +
@@ -511,7 +673,7 @@ function renderVersionDetail(detail) {
   const parts = buildResultHtml(detail.result, winIndex);
 
   return `<div class="section-title">当时输入（不可变快照）</div>` +
-    `<table><thead><tr><th>事件名称</th><th>最早开始</th><th>最晚开始</th>` +
+    `<table><thead><tr><th>事件名称</th><th>最早开始(当地+偏移)</th><th>最晚开始(当地+偏移)</th>` +
     `<th>持续(分钟)</th><th>备注</th></tr></thead><tbody>${rows}</tbody></table>` +
     `<div class="section-title">“先于”关系</div><div class="vm-relations">${rels}</div>` +
     `<div class="section-title">当时推算依据与结果</div>` +
@@ -575,7 +737,7 @@ function fmtGap(g) {
 }
 
 const INPUT_FIELD_LABELS = {
-  earliest_start: "最早开始", latest_start: "最晚开始",
+  timezone: "时区", earliest_start: "最早开始", latest_start: "最晚开始",
   duration_minutes: "持续分钟数", note: "备注",
 };
 const WINDOW_FIELD_LABELS = {
@@ -586,7 +748,8 @@ const WINDOW_FIELD_LABELS = {
 function changeRows(changes, labels, isTime) {
   return Object.keys(changes).map((f) => {
     const c = changes[f];
-    const fmt = isTime ? (v) => fmtVal(v).replace("T", " ") : fmtVal;
+    // 时区字段是 IANA 名（非时间），按普通字段展示；时间字段把 T 换成空格
+    const fmt = (isTime && f !== "timezone") ? (v) => fmtVal(v).replace("T", " ") : fmtVal;
     return `<tr><td>${labels[f] || f}</td><td>${fmt(c.from)}</td><td>${fmt(c.to)}</td></tr>`;
   }).join("");
 }
@@ -616,7 +779,7 @@ function compareRawHtml(data) {
 }
 
 function eventBriefHtml(e, tag) {
-  return `<div class="card ${tag}"><h3>「${escapeHtml(e.name)}」` +
+  return `<div class="card ${tag}"><h3>「${escapeHtml(e.name)}」${tzBadge(e.timezone)}` +
     (e.draft ? ` <span class="badge warn">暂存</span>` : "") + `</h3>` +
     `<div class="hint">输入范围：${fmtVal(e.earliest_start).replace("T", " ")} ~ ` +
     `${fmtVal(e.latest_start).replace("T", " ")}` +
@@ -757,7 +920,9 @@ $("#btn-finalize").addEventListener("click", finalize);
 $("#btn-add-event").addEventListener("click", () => {
   syncFromDOM();
   state.editEvents.push({
-    key: newKey(), name: "新事件", earliest_start: "", latest_start: "",
+    key: newKey(), name: "新事件", timezone: "",
+    earliest_start: "", earliest_offset: "",
+    latest_start: "", latest_offset: "",
     duration_minutes: "", note: "",
   });
   renderEventsTable();
@@ -788,6 +953,7 @@ $("#btn-add-relation").addEventListener("click", () => {
 /* ---------------------------------------------------------------- 启动 */
 
 (async function init() {
+  initTimezoneDatalist();
   await loadReviews();
   if (state.reviews.length) await openReview(state.reviews[0].id);
 })();

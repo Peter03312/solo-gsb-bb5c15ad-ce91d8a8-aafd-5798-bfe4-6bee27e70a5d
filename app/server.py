@@ -28,6 +28,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import db
+import timeutil
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -51,7 +52,13 @@ class ApiError(Exception):
 
 
 def validate_event(e):
-    """校验并规范化单个事件输入，返回规范后的 dict。"""
+    """校验并规范化单个事件输入，返回规范后的 dict。
+
+    未指定时区（timezone 为空）的事件沿用既有语义：时间为不带偏移的本地
+    字符串（``YYYY-MM-DDTHH:MM``），不做时区解释。指定 IANA 时区的事件，
+    已填写的最早/最晚开始必须带 UTC 偏移，且偏移符合该时区当日规则；
+    不存在的当地时刻或错误偏移在此抛 400，整次保存拒绝。
+    """
     if not isinstance(e, dict):
         raise ApiError(400, "事件格式不正确")
     name = str(e.get("name") or "").strip()
@@ -60,13 +67,42 @@ def validate_event(e):
     if len(name) > 200:
         raise ApiError(400, "事件名称过长")
 
+    tz_name = str(e.get("timezone") or "").strip()
+    zone = None
+    if tz_name:
+        try:
+            zone = timeutil.get_zone(tz_name)
+        except timeutil.TimeError as ex:
+            raise ApiError(400, "事件「{}」的{}".format(name, ex))
+        tz_name = str(zone)
+
     def norm_time(value, label):
         if value in (None, ""):
             return None
         try:
-            return datetime.fromisoformat(str(value)).isoformat(timespec="minutes")
+            dt = datetime.fromisoformat(str(value))
         except ValueError:
             raise ApiError(400, "事件「{}」的{}格式不正确".format(name, label))
+        dt = dt.replace(second=0, microsecond=0)
+        if zone is None:
+            # 既有语义：未指定时区的时间必须是不带偏移的“朴素”时间；
+            # 不允许在未指定时区的事件里夹带 UTC 偏移。
+            if dt.tzinfo is not None:
+                raise ApiError(
+                    400, "事件「{}」的{}携带了 UTC 偏移，但该事件未指定时区"
+                    .format(name, label))
+            return dt.isoformat(timespec="minutes")
+        # 带时区事件：必须携带与该时区当日规则一致的偏移；
+        # 不存在的当地时刻、错误偏移（含重复时刻的无效偏移）整次拒绝。
+        if dt.tzinfo is None or dt.utcoffset() is None:
+            raise ApiError(
+                400, "事件「{}」指定了时区「{}」，{}必须带 UTC 偏移"
+                "（当地时间，如 2026-11-01T01:30-05:00）".format(
+                    name, tz_name, label))
+        try:
+            return timeutil.check_zoned(dt, zone, tz_name, name, label)
+        except timeutil.TimeError as ex:
+            raise ApiError(400, str(ex))
 
     duration = e.get("duration_minutes")
     if duration in (None, ""):
@@ -83,6 +119,7 @@ def validate_event(e):
         "key": str(e.get("key") or ""),
         "uid": str(e.get("uid") or "")[:64],
         "name": name,
+        "timezone": tz_name or None,
         "earliest_start": norm_time(e.get("earliest_start"), "最早开始时间"),
         "latest_start": norm_time(e.get("latest_start"), "最晚开始时间"),
         "duration_minutes": duration,
@@ -131,6 +168,7 @@ def validate_payload(body):
         raise ApiError(400, "事件 key 缺失或重复")
     key_set = set(keys)
     name_by_key = {e["key"]: e["name"] for e in events}
+    tz_by_key = {e["key"]: e.get("timezone") for e in events}
     relations = []
     for r in body.get("relations") or []:
         if not isinstance(r, dict):
@@ -138,6 +176,16 @@ def validate_payload(body):
         a, b = str(r.get("predecessor_key") or ""), str(r.get("successor_key") or "")
         if a not in key_set or b not in key_set:
             raise ApiError(400, "“先于”关系引用了不存在的事件")
+        # 跨地区规则只允许在同类事件之间建立：带时区与未带时区事件不得建立关系
+        if bool(tz_by_key.get(a)) != bool(tz_by_key.get(b)):
+            za = tz_by_key.get(a)
+            zmark_a = "（时区 {}）".format(za) if za else "（未指定时区）"
+            zmark_b = "（时区 {}）".format(tz_by_key.get(b)) if tz_by_key.get(b) else "（未指定时区）"
+            raise ApiError(
+                400,
+                "关系「{}」{} 先于「{}」{} 不允许建立：带 IANA 时区的事件与未指定时区的"
+                "事件之间不得建立“先于”关系，请为两端同时指定时区或同时不指定".format(
+                    name_by_key[a], zmark_a, name_by_key[b], zmark_b))
         desc = "「{}」先于「{}」".format(name_by_key[a], name_by_key[b])
         min_gap = _norm_gap(r.get("min_gap_minutes"), "最短等待", desc)
         if min_gap is None:
