@@ -8,6 +8,13 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 COPY app/ /app/
 
+# IANA 时区库：跨地区事件依赖系统 zoneinfo 数据（Asia/Shanghai、
+# America/New_York 等）。slim 镜像默认不含 /usr/share/zoneinfo，用系统包
+# 补齐，不引入任何 pip 依赖。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN mkdir -p /data
 VOLUME ["/data"]
 EXPOSE 8000

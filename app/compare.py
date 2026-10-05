@@ -16,6 +16,7 @@ INPUT_FIELDS = [
     ("earliest_start", "最早开始"),
     ("latest_start", "最晚开始"),
     ("duration_minutes", "持续分钟数"),
+    ("timezone", "IANA 时区"),
     ("note", "备注"),
 ]
 
@@ -72,6 +73,7 @@ def _event_brief(event, version_data):
         "earliest_start": event.get("earliest_start"),
         "latest_start": event.get("latest_start"),
         "duration_minutes": event.get("duration_minutes"),
+        "timezone": event.get("timezone"),
         "note": event.get("note") or "",
         "draft": _is_draft(event),
         "window": _window_of(version_data, event),

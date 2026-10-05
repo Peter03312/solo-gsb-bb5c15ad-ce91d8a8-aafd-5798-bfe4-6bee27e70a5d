@@ -36,9 +36,10 @@ CREATE TABLE IF NOT EXISTS events (
     review_id       INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
     name            TEXT NOT NULL,
     earliest_start  TEXT,                          -- ISO 分钟精度，可空（暂存）
-    latest_start    TEXT,
+    latest_start    TEXT,                          -- 带时区事件保留 UTC 偏移
     duration_minutes INTEGER,
     note            TEXT NOT NULL DEFAULT '',
+    timezone        TEXT,                          -- IANA 时区名；NULL = 未指定时区（旧语义）
     uid             TEXT                           -- 跨版本持续身份，保存/恢复时沿用
 );
 CREATE TABLE IF NOT EXISTS relations (
@@ -127,6 +128,9 @@ def _migrate(conn):
     与旧语义“前项结束不晚于后项开始”完全一致。升级前已存在的事件行现场
     补发 uid，此后的保存即可沿用身份；已写入的旧快照不含 uid，对照时按
     “缺可靠身份”处理，只展示原貌，不回填、不猜配。
+
+    events.timezone 同为可空迁移列：旧行与旧快照没有该列（视为未指定
+    时区），继续按朴素本地时间的既有语义处理，绝不回填时区。
     """
     cols = {row[1] for row in conn.execute("PRAGMA table_info(relations)")}
     if "min_gap_minutes" not in cols:
@@ -140,6 +144,8 @@ def _migrate(conn):
         conn.execute("ALTER TABLE events ADD COLUMN uid TEXT")
         for (eid,) in conn.execute("SELECT id FROM events WHERE uid IS NULL").fetchall():
             conn.execute("UPDATE events SET uid=? WHERE id=?", (_new_uid(), eid))
+    if "timezone" not in event_cols:
+        conn.execute("ALTER TABLE events ADD COLUMN timezone TEXT")
 
 
 def connect(db_path):
@@ -375,6 +381,7 @@ def _current_input(conn, review_id):
         "latest_start": e["latest_start"],
         "duration_minutes": e["duration_minutes"],
         "note": e["note"],
+        "timezone": e.get("timezone"),
     } for e in events]
     snapshot_relations = _snapshot_relations(relations, key_by_id)
     return events, relations, snapshot_events, snapshot_relations
@@ -402,6 +409,7 @@ def _save_version(conn, review_id, version, title, events, relations, kind, now=
         "latest_start": e["latest_start"],
         "duration_minutes": e["duration_minutes"],
         "note": e["note"],
+        "timezone": e.get("timezone"),
     } for e in events]
     snapshot_relations = _snapshot_relations(relations, key_by_id)
     input_json = json.dumps(
@@ -430,9 +438,9 @@ def _replace_input(conn, review_id, events, relations):
         used_uids.add(uid)
         cur = conn.execute(
             "INSERT INTO events (review_id, name, earliest_start, latest_start,"
-            " duration_minutes, note, uid) VALUES (?,?,?,?,?,?,?)",
+            " duration_minutes, note, timezone, uid) VALUES (?,?,?,?,?,?,?,?)",
             (review_id, e["name"], e.get("earliest_start"), e.get("latest_start"),
-             e.get("duration_minutes"), e.get("note", ""), uid))
+             e.get("duration_minutes"), e.get("note", ""), e.get("timezone"), uid))
         key_to_id[e["key"]] = cur.lastrowid
     for r in relations:
         min_gap = r.get("min_gap_minutes")

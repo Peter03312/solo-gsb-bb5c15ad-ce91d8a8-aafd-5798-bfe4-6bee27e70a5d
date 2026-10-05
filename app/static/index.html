@@ -30,15 +30,40 @@
     </div>
 
     <h2>事件</h2>
-    <p class="hint">记录每个事件的起始时间范围与持续分钟数。缺少时间范围的事件将作为“暂存”保存，暂不参与推算。</p>
+    <p class="hint">记录每个事件的起始时间范围与持续分钟数。缺少时间范围的事件将作为“暂存”保存，暂不参与推算。
+      跨地区事故可在「时区」列填写 IANA 时区（如 Asia/Shanghai、America/New_York，留空表示不指定时区）；
+      指定时区后，最早/最晚开始须填写<strong>带 UTC 偏移的当地时间</strong>（如 2026-11-01T01:30-05:00），
+      偏移须符合该时区当日夏令时规则，否则整次保存会被拒绝。带时区与未带时区的事件之间不能建立“先于”关系。</p>
     <table id="events-table">
       <thead>
         <tr>
-          <th>事件名称</th><th>最早开始</th><th>最晚开始</th><th>持续(分钟)</th><th>备注</th><th></th>
+          <th>事件名称</th><th>时区(IANA)</th><th>最早开始（当地+偏移）</th><th>最晚开始（当地+偏移）</th><th>持续(分钟)</th><th>备注</th><th></th>
         </tr>
       </thead>
       <tbody></tbody>
     </table>
+    <datalist id="tz-list">
+      <option value="UTC"></option>
+      <option value="Asia/Shanghai"></option>
+      <option value="Asia/Hong_Kong"></option>
+      <option value="Asia/Tokyo"></option>
+      <option value="Asia/Singapore"></option>
+      <option value="Asia/Dubai"></option>
+      <option value="Asia/Kolkata"></option>
+      <option value="Asia/Bangkok"></option>
+      <option value="Asia/Seoul"></option>
+      <option value="Europe/London"></option>
+      <option value="Europe/Berlin"></option>
+      <option value="Europe/Paris"></option>
+      <option value="Europe/Moscow"></option>
+      <option value="America/New_York"></option>
+      <option value="America/Chicago"></option>
+      <option value="America/Denver"></option>
+      <option value="America/Los_Angeles"></option>
+      <option value="America/Sao_Paulo"></option>
+      <option value="Australia/Sydney"></option>
+      <option value="Pacific/Auckland"></option>
+    </datalist>
     <button id="btn-add-event">+ 添加事件</button>
 
     <h2>“先于”关系</h2>

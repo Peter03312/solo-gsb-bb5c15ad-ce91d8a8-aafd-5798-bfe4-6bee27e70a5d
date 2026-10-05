@@ -41,6 +41,26 @@
 - **多人协作并发控制**：基于 `reviews.version` 的乐观锁。携带旧版本号的提交会被
   拒绝（HTTP 409）并提示刷新，不会覆盖他人较新的记录。
 - **定稿**：推算通过且无暂存事件时可定稿；定稿后再次修改会自动回到草稿状态。
+- **跨地区事故时区（本轮新增）**：事件可指定 **IANA 时区**（如 `Asia/Shanghai`、
+  `Europe/London`、`America/New_York`，留空 = 不指定时区）。指定时区后，
+  已填写的最早、最晚开始必须是**带 UTC 偏移的当地时间**（如
+  `2026-11-01T01:30-05:00`），偏移须符合该时区当日规则：
+  - 夏令时**回退的重复时刻**（同一面盘时间出现两次）按所填偏移区分是哪一次，
+    两次都合法（例如纽约 2026-11-01 01:30 可填 `-04:00` 或 `-05:00`，对应
+    不同的绝对时刻）；
+  - 夏令时**向前跳过、不存在的当地时刻**（如纽约 2026-03-08 02:30），或与
+    当日规则不符的错误偏移、漏填偏移，都会让**整次保存被拒绝（HTTP 400）**，
+    不写入任何记录。
+  - 带时区事件的关系按**绝对分钟**（UTC 时刻）施加持续时长与最短、最长等待；
+    输入区间先后也按绝对时间判断（与各事件所在时区、当日夏令时无关）。推算
+    结果与依据链按**各事件当地时间和偏移**展示（窗口另带该事件的 IANA 时区）。
+  - **带时区与未带时区事件之间不得建立“先于”关系**，服务端明确报错（HTTP 400）；
+    未指定时区的现有输入、输出保持既有朴素本地时间语义不变（且不允许携带偏移，
+    以免静默改变旧语义）。
+  - 保存、版本回看、恢复、对照均**完整保留时区与偏移，不改写任何旧快照**；
+    冲突、暂存、定稿规则与过期版本的 409 行为保持不变。
+  - 网页事件表新增「时区(IANA)」列（常用时区可下拉选择，也可手填任意 IANA 名），
+    指定时区后时间框输入带偏移的当地时间，结果、版本回看与对照弹窗均显示时区。
 
 ## 容器启动
 
@@ -80,7 +100,14 @@ python3 tests/test_compute.py  # 推算引擎单元测试（含间隔上下界�
 python3 tests/test_versions.py # 版本快照/回看/恢复、旧库兼容单元测试
 python3 tests/test_api.py      # HTTP API 端到端测试（间隔校验、409、恢复保留间隔）
 python3 tests/test_compare.py  # 版本对照测试（身份配对、差值、只读、错误路径）
+python3 tests/test_timezone.py # 跨地区时区单元测试（夏令时 gap/重复时刻、绝对分钟推算、当地展示）
+python3 tests/test_api_timezone.py # 跨地区时区 HTTP API 端到端测试（400 拒绝、回看/恢复/对照保留时区）
 ```
+
+> 跨地区时区依赖系统 IANA 时区库（Python 标准库 `zoneinfo` 读取
+> `/usr/share/zoneinfo`）。容器镜像已通过系统包 `tzdata` 内置；在缺少时区库的
+> 精简 Linux 上可安装系统包 `tzdata`（Debian/Ubuntu：`apt-get install tzdata`），
+> Windows 上本地开发可使用 `pip install tzdata`。服务本身不引入任何第三方依赖。
 
 ## HTTP API 简介
 
@@ -89,7 +116,7 @@ python3 tests/test_compare.py  # 版本对照测试（身份配对、差值、�
 | GET | `/api/reviews` | 复盘列表 |
 | POST | `/api/reviews` | 新建复盘 `{title}` |
 | GET | `/api/reviews/{id}` | 复盘快照：元信息 + 原始输入 + 最近一次推算结果 |
-| PUT | `/api/reviews/{id}` | 整体保存并重新推算 `{base_version, title, events, relations}`；关系可带 `min_gap_minutes` / `max_gap_minutes`；版本过期返回 409，间隔非法返回 400 |
+| PUT | `/api/reviews/{id}` | 整体保存并重新推算 `{base_version, title, events, relations}`；事件可带 `timezone`（IANA 名，带时区时时间须带 UTC 偏移），关系可带 `min_gap_minutes` / `max_gap_minutes`；版本过期返回 409，间隔非法/偏移非法/不存在的当地时刻/跨时区混建关系返回 400 |
 | POST | `/api/reviews/{id}/finalize` | 定稿 `{base_version}`；有冲突或暂存事件返回 400 |
 | GET | `/api/reviews/{id}/versions` | 版本列表（含回看/恢复标记；旧库无快照版本 `reviewable=false`） |
 | GET | `/api/reviews/{id}/versions/{v}` | 版本回看：当时标题/事件/关系输入 + 推算依据与状态；旧库无快照返回 422 |
@@ -231,6 +258,67 @@ curl -s -X POST http://localhost:8000/api/reviews/1/versions/2/restore \
 （例如最长等待小于前项结束到后项最早开始的距离），推算状态为 `conflict`，
 冲突明细中给出冲突事件与正/反两条依据链，输入保留但不得定稿。
 
+### 跨地区事故时区（本轮新增，HTTP 示例）
+
+事件通过可选的 `timezone` 字段指定 IANA 时区；一旦指定，`earliest_start` /
+`latest_start` 必须是带 UTC 偏移的当地时间。推算在内部全部换算为绝对分钟，
+返回结果按每个事件自身的当地时间与偏移展示，窗口对象额外带 `timezone` 字段。
+
+```bash
+# 1) 上海 10:00(+08:00) 告警，纽约团队响应；A 先于 B（A 持续 15 分钟）
+curl -s -X PUT http://localhost:8000/api/reviews/1 \
+  -H 'Content-Type: application/json' -d '{
+    "base_version": 1, "title": "跨地区支付故障",
+    "events": [
+      {"key": "a", "name": "上海告警", "timezone": "Asia/Shanghai",
+       "earliest_start": "2026-10-01T10:00+08:00",
+       "latest_start":   "2026-10-01T10:00+08:00",
+       "duration_minutes": 15},
+      {"key": "b", "name": "纽约响应", "timezone": "America/New_York",
+       "earliest_start": "2026-09-30T20:00-04:00",
+       "latest_start":   "2026-10-01T12:00-04:00",
+       "duration_minutes": 30}
+    ],
+    "relations": [{"predecessor_key": "a", "successor_key": "b"}]}'
+# windows 中 B 的最早可行开始按纽约当地时间展示（= 上海 10:15+08 即 02:15 UTC）：
+#   {"2": {"timezone": "America/New_York",
+#          "earliest_start": "2026-09-30T22:15-04:00",
+#          "latest_start":   "2026-10-01T12:00-04:00", ...}}
+# 依据链同时出现两地时间：「上海告警」…2026-10-01T10:00+08:00 ⇒
+#   「纽约响应」最早开始不早于 2026-09-30T22:15-04:00
+
+# 2) 夏令时回退的重复时刻：纽约 2026-11-01 01:30 出现两次，
+#    -04:00（第一次，05:30 UTC）与 -05:00（第二次，06:30 UTC）都合法
+curl -s -X PUT http://localhost:8000/api/reviews/1 \
+  -H 'Content-Type: application/json' -d '{
+    "base_version": 2, "title": "跨地区支付故障",
+    "events": [{"key": "b", "name": "纽约响应", "timezone": "America/New_York",
+       "earliest_start": "2026-11-01T01:30-04:00",
+       "latest_start":   "2026-11-01T12:00-05:00",
+       "duration_minutes": 30}], "relations": []}'
+
+# 3) 不存在的当地时刻（纽约 2026-03-08 02:30 因春令时被跳过）→ 整次保存 400
+# 400 {"error": "事件「纽约响应」的最早开始时间：当地时间 2026-03-08T02:30
+#   在时区 America/New_York 不存在（处于夏令时切换被跳过的时段），请改用真实
+#   存在的当地时刻"}
+
+# 4) 错误偏移（7 月纽约是夏令时 -04:00，却填 -05:00）→ 整次保存 400
+# 400 {"error": "…时间 2026-07-01T21:00 携带的偏移 UTC-05:00 不符合时区
+#   America/New_York 当时的规则（应为 UTC-04:00）"}
+
+# 5) 漏填偏移 → 400；未指定时区却携带偏移 → 400；非法 IANA 名 → 400
+# 6) 带时区与未带时区事件之间建立“先于”关系 → 400
+# 400 {"error": "带时区事件与未带时区事件之间不得建立“先于”关系：「上海告警」
+#   带时区，「本地排查」未带时区；请为两端统一指定或清空时区"}
+```
+
+保存成功后，时区与偏移会随事件持久化并进入该版本不可变快照：
+`GET /api/reviews/{id}/versions/{v}` 的 `input.events[].timezone` 与带偏移时间、
+`result.windows[].timezone` 与当地窗口均可回看；`restore` 另存的新草稿沿用同样
+的时区与偏移；`compare` 会把 `timezone` 作为事件输入变化的一列（同一持续身份
+`uid` 改了时区会在 `input_changes.timezone` 体现）。不带 `timezone` 的旧事件、
+旧快照继续按朴素本地时间处理，旧快照不被改写。
+
 ### 多路径上下界矛盾的冲突归因（本轮变动）
 
 关系图无有向环、但多条路径的间隔上下界相互矛盾时，推算**不再误报**
@@ -281,14 +369,17 @@ curl -s -X PUT http://localhost:8000/api/reviews/1 \
 
 ```
 app/
-  server.py          HTTP 服务（标准库 http.server）、间隔设置校验、对照路由
+  server.py          HTTP 服务（标准库 http.server）、间隔设置校验、时区/偏移校验、对照路由
   db.py              SQLite 持久化、乐观锁、事件持续身份（uid）、启动时建表与老库迁移
-  compute.py         时间窗推算与依据链生成（含间隔上下界传播）
+  compute.py         时间窗推算与依据链生成（含间隔上下界传播、跨时区绝对分钟推算）
+  tzutil.py          IANA 时区与带偏移当地时间校验（夏令时 gap/重复时刻）、按时区展示
   compare.py         版本对照：跨版本按 uid 配对与差值计算（纯函数，只读）
   static/            浏览器单页界面（原生 HTML/JS/CSS）
 tests/test_compute.py  推算引擎单元测试
 tests/test_versions.py 版本快照/回看/恢复与旧库兼容测试
 tests/test_api.py      HTTP API 端到端测试
 tests/test_compare.py  版本对照测试（身份配对、差值、只读、错误路径）
+tests/test_timezone.py 跨地区时区单元测试（偏移/夏令时校验、绝对分钟推算）
+tests/test_api_timezone.py 跨地区时区 HTTP API 端到端测试
 Dockerfile / docker-compose.yml / .dockerignore
 ```

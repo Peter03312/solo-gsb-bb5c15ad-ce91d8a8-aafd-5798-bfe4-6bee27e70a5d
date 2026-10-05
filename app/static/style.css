@@ -83,7 +83,14 @@ th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--bord
 th { color: var(--muted); font-weight: normal; font-size: 12px; }
 td input { width: 100%; }
 td input[type="datetime-local"] { min-width: 150px; }
+td input.tztime { min-width: 188px; font-family: ui-monospace, monospace; font-size: 12px; }
+td input.tz { min-width: 140px; }
 td .row-del { padding: 2px 8px; }
+.tz-tag {
+  font-size: 11px; padding: 1px 7px; border-radius: 9px;
+  border: 1px solid var(--accent); color: var(--accent);
+  font-family: ui-monospace, monospace; font-weight: normal;
+}
 
 .relation-add { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
 .relation-add select { max-width: 220px; }

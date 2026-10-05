@@ -70,6 +70,7 @@ function resetEdits() {
     id: e.id,
     uid: e.uid || "",   // 事件持续身份：保存时回传，跨版本对照按它配对
     name: e.name,
+    timezone: e.timezone || "",
     earliest_start: e.earliest_start || "",
     latest_start: e.latest_start || "",
     duration_minutes: e.duration_minutes === null ? "" : e.duration_minutes,
@@ -119,6 +120,16 @@ function render() {
   renderResults();
 }
 
+/* 时间输入：带时区用文本框（可含 UTC 偏移，如 2026-11-01T01:30-05:00）；
+   未带时区用浏览器 datetime-local（朴素本地时间，旧语义）。 */
+function timeInputHtml(field, tz) {
+  if (tz) {
+    return `<input data-f="${field}" class="tztime" type="text" inputmode="numeric"` +
+      ` placeholder="YYYY-MM-DDTHH:MM±HH:MM">`;
+  }
+  return `<input data-f="${field}" type="datetime-local">`;
+}
+
 function renderEventsTable() {
   const tbody = $("#events-table tbody");
   tbody.innerHTML = "";
@@ -127,16 +138,24 @@ function renderEventsTable() {
     tr.dataset.key = e.key;
     tr.innerHTML =
       `<td><input data-f="name" type="text" value=""></td>` +
-      `<td><input data-f="earliest_start" type="datetime-local"></td>` +
-      `<td><input data-f="latest_start" type="datetime-local"></td>` +
+      `<td><input data-f="timezone" class="tz" type="text" list="tz-list"` +
+      ` placeholder="留空=不指定"></td>` +
+      `<td>${timeInputHtml("earliest_start", e.timezone)}</td>` +
+      `<td>${timeInputHtml("latest_start", e.timezone)}</td>` +
       `<td><input data-f="duration_minutes" type="number" min="0" style="width:80px"></td>` +
       `<td><input data-f="note" type="text"></td>` +
       `<td><button class="row-del" title="删除事件">✕</button></td>`;
     tr.querySelector('[data-f="name"]').value = e.name;
+    tr.querySelector('[data-f="timezone"]').value = e.timezone;
     tr.querySelector('[data-f="earliest_start"]').value = e.earliest_start;
     tr.querySelector('[data-f="latest_start"]').value = e.latest_start;
     tr.querySelector('[data-f="duration_minutes"]').value = e.duration_minutes;
     tr.querySelector('[data-f="note"]').value = e.note;
+    // 时区改变会改变时间输入的形态（朴素 vs 带偏移）：先同步 DOM 再整体重绘
+    tr.querySelector('[data-f="timezone"]').addEventListener("change", () => {
+      syncFromDOM();
+      renderEventsTable();
+    });
     tr.querySelector(".row-del").addEventListener("click", () => {
       syncFromDOM();
       state.editEvents = state.editEvents.filter((x) => x.key !== e.key);
@@ -166,6 +185,29 @@ function parseGapInput(raw, label, emptyValue) {
   if (s === "") return { ok: true, value: emptyValue };
   if (!/^\d+$/.test(s)) return { ok: false, message: `“先于”关系的${label}必须是非负整数分钟` };
   return { ok: true, value: parseInt(s, 10) };
+}
+
+/* 带时区事件：已填写时间必须能被 Date 解析且带 UTC 偏移（末段 Z 或 ±HH:MM）；
+   未带时区事件：时间不得携带偏移。偏移是否符合该时区当日规则由服务端裁定，
+   这里只做形态预检，真正的夏令时不存在时刻/错误偏移由服务端整次拒绝。 */
+function checkEventTimeInput(e) {
+  const hasOffset = (v) => /[zZ]$|[+-]\d{2}:?\d{2}$/.test(String(v).trim());
+  for (const f of ["earliest_start", "latest_start"]) {
+    const v = (e[f] || "").trim();
+    if (!v) continue;
+    if (e.timezone) {
+      if (!hasOffset(v)) {
+        return `事件「${e.name}」指定了时区 ${e.timezone}，${f === "earliest_start" ? "最早" : "最晚"}` +
+          `开始必须携带 UTC 偏移（例如 ${v}+08:00）`;
+      }
+      if (Number.isNaN(new Date(v).getTime())) {
+        return `事件「${e.name}」的${f === "earliest_start" ? "最早" : "最晚"}开始不是合法的带偏移日期时间`;
+      }
+    } else if (hasOffset(v)) {
+      return `事件「${e.name}」未指定时区，${f === "earliest_start" ? "最早" : "最晚"}开始不得携带 UTC 偏移`;
+    }
+  }
+  return null;
 }
 
 function renderRelations() {
@@ -260,8 +302,10 @@ function buildResultHtml(res, evByKey) {
         const ev = evByKey[id];
         const name = ev ? ev.name : id;
         const dur = ev ? ev.duration_minutes : "";
+        const tz = w.timezone || (ev ? ev.timezone : "") || "";
+        const tzTag = tz ? ` <span class="tz-tag">${escapeHtml(tz)}</span>` : "";
         return `<div class="card">` +
-          `<h3>「${escapeHtml(name)}」 <span class="window">${w.earliest_start.replace("T", " ")} ~ ${w.latest_start.replace("T", " ")}</span></h3>` +
+          `<h3>「${escapeHtml(name)}」${tzTag} <span class="window">${w.earliest_start.replace("T", " ")} ~ ${w.latest_start.replace("T", " ")}</span></h3>` +
           `<div class="hint">可行结束窗口：${w.earliest_end.replace("T", " ")} ~ ${w.latest_end.replace("T", " ")}` +
           (dur === null || dur === undefined || dur === "" ? "" : `（持续 ${dur} 分钟）`) + `</div>` +
           `<details><summary>最早可行开始的依据链</summary>${chainHtml(w.earliest_chain)}</details>` +
@@ -302,6 +346,7 @@ function syncFromDOM() {
     const e = state.editEvents.find((x) => x.key === tr.dataset.key);
     if (!e) return;
     e.name = tr.querySelector('[data-f="name"]').value.trim();
+    e.timezone = tr.querySelector('[data-f="timezone"]').value.trim();
     e.earliest_start = tr.querySelector('[data-f="earliest_start"]').value;
     e.latest_start = tr.querySelector('[data-f="latest_start"]').value;
     const d = tr.querySelector('[data-f="duration_minutes"]').value;
@@ -313,6 +358,13 @@ function syncFromDOM() {
 async function save() {
   if (!state.current) return;
   syncFromDOM();
+  for (const e of state.editEvents) {
+    const problem = checkEventTimeInput(e);
+    if (problem) {
+      showBanner("⚠ " + escapeHtml(problem));
+      return;
+    }
+  }
   const relations = [];
   for (const r of state.editRelations) {
     const min = parseGapInput(r.min_gap_minutes, "最短等待", 0);
@@ -340,6 +392,7 @@ async function save() {
       key: e.key,
       uid: e.uid || "",
       name: e.name,
+      timezone: e.timezone || null,
       earliest_start: e.earliest_start || null,
       latest_start: e.latest_start || null,
       duration_minutes: e.duration_minutes === "" ? null : e.duration_minutes,
@@ -493,6 +546,7 @@ function renderVersionDetail(detail) {
 
   const rows = events.map((e) =>
     `<tr><td>${escapeHtml(e.name)}</td>` +
+    `<td>${escapeHtml(e.timezone || "")}</td>` +
     `<td>${fmtTime(e.earliest_start)}</td>` +
     `<td>${fmtTime(e.latest_start)}</td>` +
     `<td>${e.duration_minutes === null || e.duration_minutes === undefined ? "—" : e.duration_minutes}</td>` +
@@ -511,7 +565,7 @@ function renderVersionDetail(detail) {
   const parts = buildResultHtml(detail.result, winIndex);
 
   return `<div class="section-title">当时输入（不可变快照）</div>` +
-    `<table><thead><tr><th>事件名称</th><th>最早开始</th><th>最晚开始</th>` +
+    `<table><thead><tr><th>事件名称</th><th>时区</th><th>最早开始</th><th>最晚开始</th>` +
     `<th>持续(分钟)</th><th>备注</th></tr></thead><tbody>${rows}</tbody></table>` +
     `<div class="section-title">“先于”关系</div><div class="vm-relations">${rels}</div>` +
     `<div class="section-title">当时推算依据与结果</div>` +
@@ -576,7 +630,7 @@ function fmtGap(g) {
 
 const INPUT_FIELD_LABELS = {
   earliest_start: "最早开始", latest_start: "最晚开始",
-  duration_minutes: "持续分钟数", note: "备注",
+  duration_minutes: "持续分钟数", timezone: "IANA 时区", note: "备注",
 };
 const WINDOW_FIELD_LABELS = {
   earliest_start: "最早可行开始", latest_start: "最晚可行开始",
@@ -617,6 +671,7 @@ function compareRawHtml(data) {
 
 function eventBriefHtml(e, tag) {
   return `<div class="card ${tag}"><h3>「${escapeHtml(e.name)}」` +
+    (e.timezone ? ` <span class="tz-tag">${escapeHtml(e.timezone)}</span>` : "") +
     (e.draft ? ` <span class="badge warn">暂存</span>` : "") + `</h3>` +
     `<div class="hint">输入范围：${fmtVal(e.earliest_start).replace("T", " ")} ~ ` +
     `${fmtVal(e.latest_start).replace("T", " ")}` +
@@ -757,7 +812,7 @@ $("#btn-finalize").addEventListener("click", finalize);
 $("#btn-add-event").addEventListener("click", () => {
   syncFromDOM();
   state.editEvents.push({
-    key: newKey(), name: "新事件", earliest_start: "", latest_start: "",
+    key: newKey(), name: "新事件", timezone: "", earliest_start: "", latest_start: "",
     duration_minutes: "", note: "",
   });
   renderEventsTable();
